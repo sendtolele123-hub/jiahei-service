@@ -24,10 +24,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run processor
+      - name: Run agent
         env:
           MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
           AGENTMAIL_API_KEY: ${{ secrets.AGENTMAIL_API_KEY }}
           JIAHEI_INBOX: ${{ secrets.JIAHEI_INBOX }}
-          BOLD_CONCURRENCY: '10'  # 并发调 MiMo 路数；遇限速可降到 5
-        run: python process.py
+        run: python agent.py

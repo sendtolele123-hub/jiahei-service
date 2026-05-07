@@ -41,8 +41,13 @@ def api(method: str, path: str, body=None, raw=False):
 
 
 def list_unprocessed():
-    """返回未打 processed/failed label 的『收到』消息列表（排除自己 sent 的）。"""
-    resp = api("GET", f"/v0/inboxes/{_q(INBOX)}/messages?limit=20")
+    """返回未打 processed/failed label 的『收到』消息列表（排除自己 sent 的）。
+
+    AgentMail 反垃圾算法对首次跨域邮件较保守，常把合法 Gmail 邮件判 spam。
+    所以 include_spam=true，让 spam 邮件也被处理（无 EPUB 附件的 spam
+    只回 help 不调 LLM，token 浪费可忽略）。
+    """
+    resp = api("GET", f"/v0/inboxes/{_q(INBOX)}/messages?limit=20&include_spam=true")
     msgs = resp.get("messages", [])
     out = []
     for m in msgs:

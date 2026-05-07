@@ -13,8 +13,10 @@ INBOX = os.environ.get("JIAHEI_INBOX", "jiahei@agentmail.to")
 
 LABEL_PROCESSED = "jiahei-processed"
 LABEL_FAILED    = "jiahei-failed"
+LABEL_ACKED     = "jiahei-acked"      # 已发"已收到"邮件、正在处理
 DEFAULT_RATIO   = 0.30
-MAX_EPUB_BYTES  = 25 * 1024 * 1024  # 25 MB 上限
+DEFAULT_CONCURRENCY = int(os.environ.get("BOLD_CONCURRENCY", "10"))
+MAX_EPUB_BYTES  = 50 * 1024 * 1024     # 50 MB 上限（覆盖大书）
 
 
 def api(method: str, path: str, body=None, raw=False):
@@ -88,6 +90,13 @@ def parse_ratio(subject: str) -> float:
         return DEFAULT_RATIO
 
 
+def estimate_seconds(filesize: int, concurrency: int) -> int:
+    """粗估处理时间（秒）。基于：每段平均 200 字 + 每段 LLM 调用 3s。"""
+    # 经验值：1KB 文本约 2-3 段中文
+    paras = max(1, filesize // 800)
+    return int(paras * 3 / concurrency)
+
+
 HELP_TEXT = """你好！我是加黑机器人 jiahei@agentmail.to。
 
 用法：
@@ -108,7 +117,9 @@ def handle(msg: dict):
     msg_id  = msg["message_id"]
     subject = msg.get("subject") or ""
     sender  = msg.get("from", "<unknown>")
-    print(f"  subject={subject!r} from={sender}")
+    labels  = set(msg.get("labels", []))
+    already_acked = LABEL_ACKED in labels
+    print(f"  subject={subject!r} from={sender} acked={already_acked}")
 
     epub_atts = [a for a in msg.get("attachments", [])
                  if a.get("filename", "").lower().endswith(".epub")]
@@ -118,22 +129,43 @@ def handle(msg: dict):
         return
 
     att = epub_atts[0]
-    if att.get("size", 0) > MAX_EPUB_BYTES:
-        reply(msg_id, f"文件过大（{att.get('size')} 字节，上限 {MAX_EPUB_BYTES}）。")
+    size = att.get("size", 0)
+    if size > MAX_EPUB_BYTES:
+        reply(msg_id, f"❌ 文件过大\n附件 {size/1024/1024:.1f} MB，上限 {MAX_EPUB_BYTES/1024/1024:.0f} MB。")
         add_label(msg_id, LABEL_FAILED)
         return
 
-    print(f"  downloading attachment {att['attachment_id']} ({att.get('size','?')} bytes)")
-    epub_bytes = download_attachment(msg_id, att["attachment_id"])
-
     ratio = parse_ratio(subject)
     print(f"  target ratio = {ratio}")
+
+    # 立刻发"已收到"ack（除非这是 cron 中断后的续跑——用 LABEL_ACKED 防重）
+    if not already_acked:
+        eta_sec = estimate_seconds(size, DEFAULT_CONCURRENCY)
+        eta_min = max(1, round(eta_sec / 60))
+        ack_text = (
+            f"✅ 已收到你的 EPUB，开始处理。\n\n"
+            f"- 文件大小：{size/1024:.0f} KB\n"
+            f"- 目标加黑比例：{int(ratio*100)}%\n"
+            f"- 并发：{DEFAULT_CONCURRENCY} 路\n"
+            f"- 预估耗时：约 {eta_min} 分钟（大书可能更长）\n\n"
+            f"完成后会再发一封带加黑后 EPUB 的回信，不用重复发送。"
+        )
+        try:
+            reply(msg_id, ack_text)
+            add_label(msg_id, LABEL_ACKED)
+            print(f"  📨 ack sent to {sender}")
+        except Exception as e:
+            print(f"  [warn] ack reply failed: {e!r}")
+
+    print(f"  downloading attachment {att['attachment_id']} ({size} bytes)")
+    epub_bytes = download_attachment(msg_id, att["attachment_id"])
 
     with tempfile.TemporaryDirectory() as td:
         in_p  = Path(td) / "in.epub"
         out_p = Path(td) / "out.epub"
         in_p.write_bytes(epub_bytes)
-        result = process_epub(str(in_p), str(out_p), ratio)
+        result = process_epub(str(in_p), str(out_p), ratio,
+                              concurrency=DEFAULT_CONCURRENCY)
         out_b64 = base64.b64encode(out_p.read_bytes()).decode()
 
     reply_text = (
@@ -141,7 +173,8 @@ def handle(msg: dict):
         f"- 段落数：{result['para_count']}（失败 {result['fail_count']}）\n"
         f"- 原文字数：{result['total_chars']}\n"
         f"- 加黑字数：{result['bold_chars']}（{result['ratio_pct']}%）\n"
-        f"- 目标比例：{int(ratio*100)}%\n\n"
+        f"- 目标比例：{int(ratio*100)}%\n"
+        f"- 处理耗时：{result.get('elapsed_sec', '?')} 秒\n\n"
         f"附件即处理后的 EPUB。"
     )
     out_filename = att["filename"].rsplit(".", 1)[0] + "_bolded.epub"

@@ -1,10 +1,11 @@
 """EPUB 加黑流水线：读 EPUB → 逐 <p> 调 MiMo 加黑 → 写新 EPUB。
 
 可作为模块导入：from epub_bold import process_epub
-也可命令行运行：python3 epub_bold.py <input.epub> <output.epub> [ratio]
+也可命令行运行：python3 epub_bold.py <input.epub> <output.epub> [ratio] [concurrency]
 """
 import json, os, sys, re, time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from ebooklib import epub
 import ebooklib
@@ -85,13 +86,13 @@ def stats(html: str) -> tuple[int, int]:
     return len(plain), bold_chars
 
 
-def process_epub(in_path: str, out_path: str, target_ratio: float = 0.30) -> dict:
-    """处理 EPUB 文件，返回统计信息字典。"""
-    book = epub.read_epub(in_path)
-    total_orig = total_bold = 0
-    para_count = 0
-    fail_count = 0
-
+def collect_paragraphs(book) -> tuple[list, list[str]]:
+    """扫一遍 book，收集所有 <p>。返回:
+    items_data: [(item, soup, xml_decl, [(p_element, global_idx), ...]), ...]
+    all_texts:  [orig_text_0, orig_text_1, ...]
+    """
+    items_data = []
+    all_texts: list[str] = []
     for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
         raw = item.get_content().decode("utf-8")
         xml_decl = ""
@@ -99,20 +100,73 @@ def process_epub(in_path: str, out_path: str, target_ratio: float = 0.30) -> dic
         if m:
             xml_decl = m.group(1)
         soup = BeautifulSoup(raw, "html.parser")
+        ps = []
         for p in soup.find_all("p"):
-            orig_text = p.get_text()
-            if len(orig_text.strip()) < 8:
+            orig = p.get_text()
+            if len(orig.strip()) < 8:
                 continue
-            para_count += 1
-            print(f"  para {para_count} ({len(orig_text)} chars)... ", end="", flush=True)
-            bolded = bold_text(orig_text, target_ratio)
-            if bolded == orig_text and len(orig_text) >= 8:
+            idx = len(all_texts)
+            all_texts.append(orig)
+            ps.append((p, idx))
+        items_data.append((item, soup, xml_decl, ps))
+    return items_data, all_texts
+
+
+def process_epub(in_path: str, out_path: str, target_ratio: float = 0.30,
+                 concurrency: int = 10, progress_cb=None) -> dict:
+    """处理 EPUB 文件，并发调 LLM 加黑后重新打包。
+
+    Args:
+        in_path:       输入 EPUB
+        out_path:      输出 EPUB
+        target_ratio:  目标加黑比例（0.05~0.6）
+        concurrency:   并发调 LLM 路数（默认 10）
+        progress_cb:   可选回调 fn(done, total) 每完成一段调一次
+
+    Returns 统计字典。
+    """
+    book = epub.read_epub(in_path)
+    items_data, all_texts = collect_paragraphs(book)
+    total_paras = len(all_texts)
+    print(f"  total paragraphs: {total_paras}, concurrency={concurrency}")
+
+    # 并发调 LLM
+    results: list[str] = [""] * total_paras
+    completed = 0
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {ex.submit(bold_text, t, target_ratio): i for i, t in enumerate(all_texts)}
+        for f in as_completed(futures):
+            i = futures[f]
+            try:
+                results[i] = f.result()
+            except Exception as e:
+                print(f"  [warn] para {i} exception: {e!r}", file=sys.stderr)
+                results[i] = all_texts[i]  # fallback to orig
+            completed += 1
+            if progress_cb:
+                try: progress_cb(completed, total_paras)
+                except Exception: pass
+            if completed % 25 == 0 or completed == total_paras:
+                elapsed = time.time() - t0
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (total_paras - completed) / rate if rate > 0 else 0
+                print(f"  progress: {completed}/{total_paras} "
+                      f"({100*completed/total_paras:.0f}%) "
+                      f"rate={rate:.1f}/s eta={eta:.0f}s")
+
+    # 串行替换 + 重打包
+    total_orig = total_bold = 0
+    fail_count = 0
+    for item, soup, xml_decl, ps in items_data:
+        for p, idx in ps:
+            bolded = results[idx]
+            orig = all_texts[idx]
+            if bolded == orig and len(orig) >= 8:
                 fail_count += 1
             o, b = stats(f"<p>{bolded}</p>")
             total_orig += o
             total_bold += b
-            ratio = b / o * 100 if o else 0
-            print(f"{ratio:.1f}%")
             new_p = BeautifulSoup(f"<p>{bolded}</p>", "html.parser").p
             p.replace_with(new_p)
         out_html = xml_decl + str(soup)
@@ -121,22 +175,24 @@ def process_epub(in_path: str, out_path: str, target_ratio: float = 0.30) -> dic
     epub.write_epub(out_path, book, {})
     overall = total_bold / total_orig * 100 if total_orig else 0
     print(f"\n=== Done ===")
-    print(f"段落数: {para_count} (失败 {fail_count})")
+    print(f"段落数: {total_paras} (失败 {fail_count})")
     print(f"原文字数: {total_orig}, 加黑字数: {total_bold}, 总比例: {overall:.1f}%")
-    print(f"输出: {out_path}")
+    print(f"耗时: {time.time()-t0:.1f}s, 输出: {out_path}")
     return {
-        "para_count": para_count,
+        "para_count": total_paras,
         "fail_count": fail_count,
         "total_chars": total_orig,
         "bold_chars": total_bold,
         "ratio_pct": round(overall, 1),
+        "elapsed_sec": round(time.time() - t0, 1),
     }
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("usage: python3 epub_bold.py <input.epub> <output.epub> [ratio=0.30]", file=sys.stderr)
+        print("usage: python3 epub_bold.py <input.epub> <output.epub> [ratio=0.30] [concurrency=10]", file=sys.stderr)
         sys.exit(1)
     in_p, out_p = sys.argv[1], sys.argv[2]
     ratio = float(sys.argv[3]) if len(sys.argv) > 3 else 0.30
-    process_epub(in_p, out_p, ratio)
+    conc  = int(sys.argv[4]) if len(sys.argv) > 4 else 10
+    process_epub(in_p, out_p, ratio, conc)

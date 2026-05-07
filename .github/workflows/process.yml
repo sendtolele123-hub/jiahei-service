@@ -12,7 +12,7 @@ concurrency:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 350    # 接近 GH Actions 单 job 上限 (6h)，覆盖 40 万字大书
     steps:
       - uses: actions/checkout@v4
 
@@ -29,4 +29,5 @@ jobs:
           MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
           AGENTMAIL_API_KEY: ${{ secrets.AGENTMAIL_API_KEY }}
           JIAHEI_INBOX: ${{ secrets.JIAHEI_INBOX }}
+          BOLD_CONCURRENCY: '10'  # 并发调 MiMo 路数；遇限速可降到 5
         run: python process.py

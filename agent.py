@@ -138,12 +138,15 @@ def run_agent(max_steps: int = 80) -> dict:
 
         # 把 assistant 的回复加到 history
         # MiMo / OpenAI compat: assistant message with optional tool_calls
+        # MiMo thinking 模式要求把上一轮的 reasoning_content 原封回传，否则 400
         assistant_entry = {"role": "assistant"}
         if msg.get("content"):
             assistant_entry["content"] = msg["content"]
             print(f"  agent: {msg['content'][:200]}")
         else:
             assistant_entry["content"] = None
+        if msg.get("reasoning_content"):
+            assistant_entry["reasoning_content"] = msg["reasoning_content"]
         if msg.get("tool_calls"):
             assistant_entry["tool_calls"] = msg["tool_calls"]
         messages.append(assistant_entry)
